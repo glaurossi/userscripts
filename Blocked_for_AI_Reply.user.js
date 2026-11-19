@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Blocked for AI Reply
 // @namespace    https://local.x-block-list
-// @version      1.0.0
+// @version      1.2.0
 // @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, cache + rate-limit aware
 // @author       glaurossi
 // @license      MIT
+// @downloadURL  https://raw.githubusercontent.com/glaurossi/userscripts/main/Blocked_for_AI_Reply.user.js
+// @updateURL    https://raw.githubusercontent.com/glaurossi/userscripts/main/Blocked_for_AI_Reply.user.js
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @grant        GM_xmlhttpRequest
@@ -21,11 +23,16 @@
 (function () {
   "use strict";
 
+  // Config
+
+  // Plain-text list from levelsio (one username per line).
   const LIST_URL = "https://blockedforaireply.levels.io/api/usernames.txt";
+  // Public X web client bearer — not a user secret.
   const BEARER =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
   // X rotates GraphQL query IDs occasionally — if lookups start failing, update this.
   const USER_BY_SCREEN_NAME_ID = "AMIBMjtxEEATh4z8V9GtRg";
+  // Feature flags the UserByScreenName query expects.
   const FEATURES = {
     hidden_profile_subscriptions_enabled: true,
     profile_label_improvements_pcf_label_in_post_enabled: true,
@@ -46,13 +53,19 @@
     withAuxiliaryUserLabels: false,
   };
 
+  // Tampermonkey storage keys (progress, block cache, panel position).
   const STORAGE_KEY = "xBlockListProgress_v1";
   const CACHE_KEY = "xBlockListBlockedCache_v1";
+  const UI_KEY = "xBlockListUi_v1";
+
+  // Pacing: real blocks wait 3–5s; skips are faster so re-runs don't drag.
   const DELAY_MIN_MS = 3000;
   const DELAY_MAX_MS = 5000;
   const SKIP_DELAY_MS = 400; // after a network lookup that we intentionally skip
   const CACHE_SKIP_DELAY_MS = 50; // known-blocked from local cache — no API call
-  const RATE_LIMIT_WAIT_MS = 15 * 60 * 1000;
+  const RATE_LIMIT_WAIT_MS = 15 * 60 * 1000; // full window; conservative on purpose
+
+  // Runtime state
 
   const state = {
     running: false,
@@ -71,14 +84,19 @@
     rateLimited: false,
     logLines: [],
     blockedCache: new Set(),
+    minimized: false,
+    panelAnchor: "bottom", // "top" | "bottom" — which vertical edge we pin
   };
 
   const LOG_MAX = 200;
+
+  // Small helpers
 
   function ts() {
     return new Date().toLocaleTimeString(undefined, { hour12: false });
   }
 
+  // Append a line to the on-panel log (and keep it from growing forever).
   function log(msg) {
     const line = "[" + ts() + "] " + msg;
     state.logLines.push(line);
@@ -103,6 +121,7 @@
       });
   }
 
+  // Turn cryptic browser/TM errors into something a human can act on.
   function friendlyError(err) {
     const msg = String(
       err && err.message ? err.message : err && err.name ? err.name + ": " + err : err
@@ -126,6 +145,7 @@
     return String(name || "").trim().toLowerCase();
   }
 
+  // Persistence: block cache + progress
   function loadBlockedCache() {
     try {
       const raw = GM_getValue(CACHE_KEY, null);
@@ -140,6 +160,7 @@
     GM_setValue(CACHE_KEY, JSON.stringify(Array.from(state.blockedCache)));
   }
 
+  // Remember a handle we blocked (or confirmed already blocked) for fast re-runs.
   function rememberBlocked(username) {
     const key = norm(username);
     if (!key || state.blockedCache.has(key)) return;
@@ -178,6 +199,7 @@
     );
   }
 
+  // Counters/index only — does not wipe the blocked-handle cache.
   function resetProgress() {
     state.index = 0;
     state.blocked = 0;
@@ -200,8 +222,10 @@
     render();
   }
 
+  // Pause-friendly delays
   let sleepCanceler = null;
 
+  // Sleep that Pause can interrupt immediately (instead of waiting out 3–5s).
   function sleep(ms) {
     return new Promise((resolve) => {
       const id = setTimeout(() => {
@@ -244,6 +268,9 @@
     return DELAY_MIN_MS + Math.floor(Math.random() * (DELAY_MAX_MS - DELAY_MIN_MS + 1));
   }
 
+  // X API helpers
+
+  // CSRF token from the logged-in session cookie.
   function getCt0() {
     const hit = document.cookie
       .split(";")
@@ -268,6 +295,7 @@
     return h;
   }
 
+  // Cross-origin list download (bypasses page CORS via GM).
   function gmGet(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -292,6 +320,7 @@
       .filter(Boolean);
   }
 
+  // Resolve a screen name → user object (and whether we already block them).
   async function lookupUser(screenName) {
     try {
       const variables = { screen_name: screenName, withSafetyModeUserFields: true };
@@ -320,6 +349,7 @@
     }
   }
 
+  // Actually create the block — only called after handle verification.
   async function blockUserId(userId) {
     try {
       const res = await pageFetch("https://x.com/i/api/1.1/blocks/create.json", {
@@ -390,6 +420,7 @@
     return result.rest_id || (result.legacy && result.legacy.id_str) || null;
   }
 
+  // Sit out a full 15 minutes (or until Pause), then the caller retries the same user.
   async function waitOutRateLimit(reason) {
     state.rateLimited = true;
     state.lastAction = "rate_limit:" + reason;
@@ -404,6 +435,10 @@
     }
     state.rateLimited = false;
   }
+
+  // Per-username pipeline
+  // Returns how the main loop should advance:
+  // advance / advance_fast / advance_cache / retry / paused_mid
 
   async function processOne(username) {
     state.current = username;
@@ -451,6 +486,7 @@
       return "advance_fast";
     }
 
+    // Safety: never block unless the API handle matches the list entry exactly.
     if (actual.toLowerCase() !== username.toLowerCase()) {
       state.skippedMismatch++;
       state.lastAction = "skip_mismatch:" + actual;
@@ -468,6 +504,7 @@
       return "advance_fast";
     }
 
+    // Pause was clicked during lookup — don't block; retry this index on resume.
     if (state.stopping) return "paused_mid";
 
     state.lastAction = "block";
@@ -515,6 +552,8 @@
     log("FAIL @" + username + " — " + state.lastDetail);
     return "advance";
   }
+
+  // Main loop
 
   async function runLoop() {
     if (state.running) return;
@@ -610,6 +649,169 @@
     return Number(n).toLocaleString();
   }
 
+  // Panel UI: position, minimize, drag
+  function loadUi() {
+    try {
+      const raw = GM_getValue(UI_KEY, null);
+      if (!raw) return null;
+      return typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveUi(panel) {
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    GM_setValue(
+      UI_KEY,
+      JSON.stringify({
+        minimized: state.minimized,
+        anchor: state.panelAnchor,
+        left: Math.round(rect.left),
+        right: Math.round(window.innerWidth - rect.right),
+        top: Math.round(rect.top),
+        bottom: Math.round(window.innerHeight - rect.bottom),
+      })
+    );
+  }
+
+  function preferBottomAnchor(panel) {
+    const rect = panel.getBoundingClientRect();
+    return rect.top + rect.height / 2 > window.innerHeight / 2;
+  }
+
+  // Snap to top+right or bottom+right so resize/collapse keeps the right edge put.
+  function applyPanelAnchor(panel, forceAnchor) {
+    const rect = panel.getBoundingClientRect();
+    const anchor =
+      forceAnchor || (preferBottomAnchor(panel) ? "bottom" : "top");
+    state.panelAnchor = anchor;
+
+    let right = window.innerWidth - rect.right;
+    right = Math.max(8, Math.min(right, window.innerWidth - rect.width - 8));
+    panel.style.left = "auto";
+
+    if (anchor === "bottom") {
+      const bottom = Math.max(
+        8,
+        Math.min(window.innerHeight - rect.bottom, window.innerHeight - rect.height - 8)
+      );
+      panel.style.top = "auto";
+      panel.style.bottom = bottom + "px";
+      panel.style.right = right + "px";
+    } else {
+      const top = Math.max(
+        8,
+        Math.min(rect.top, window.innerHeight - rect.height - 8)
+      );
+      panel.style.bottom = "auto";
+      panel.style.top = top + "px";
+      panel.style.right = right + "px";
+    }
+  }
+
+  // Collapse / expand while pinning the top-right corner, then clamp on-screen.
+  function setMinimized(panel, minimized) {
+    const rect = panel.getBoundingClientRect();
+    const pinRight = window.innerWidth - rect.right;
+    const pinTop = rect.top;
+
+    state.minimized = !!minimized;
+    panel.classList.toggle("xbl-minimized", state.minimized);
+    panel.style.width = state.minimized ? "200px" : "395px";
+    void panel.offsetWidth;
+
+    // Keep top-right fixed so the chip shrinks up-right (not down-left).
+    panel.style.left = "auto";
+    panel.style.bottom = "auto";
+    panel.style.right = pinRight + "px";
+    panel.style.top = pinTop + "px";
+    state.panelAnchor = "top";
+
+    // If the new size would leave the viewport, nudge it back in.
+    applyPanelAnchor(panel, "top");
+
+    const btn = panel.querySelector("[data-f=minmax]");
+    if (btn) {
+      btn.textContent = state.minimized ? "+" : "–";
+      btn.title = state.minimized ? "Expand" : "Minimize";
+      btn.setAttribute("aria-label", btn.title);
+    }
+    saveUi(panel);
+    render();
+  }
+
+  function enablePanelDrag(panel) {
+    const handle = panel.querySelector("[data-f=drag]");
+    if (!handle) return;
+
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let origLeft = 0;
+    let origTop = 0;
+    let moved = false;
+
+    const onMove = (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+      const width = panel.offsetWidth;
+      const height = panel.offsetHeight;
+      let left = origLeft + dx;
+      let top = origTop + dy;
+      left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+      top = Math.max(8, Math.min(top, window.innerHeight - height - 8));
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      panel.style.left = left + "px";
+      panel.style.top = top + "px";
+    };
+
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove("xbl-dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      applyPanelAnchor(panel);
+      saveUi(panel);
+    };
+
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      if (e.target.closest("[data-f=minmax]")) return;
+      dragging = true;
+      moved = false;
+      handle.classList.add("xbl-dragging");
+      const rect = panel.getBoundingClientRect();
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      panel.style.left = rect.left + "px";
+      panel.style.top = rect.top + "px";
+      startX = e.clientX;
+      startY = e.clientY;
+      origLeft = rect.left;
+      origTop = rect.top;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      e.preventDefault();
+    });
+
+    // Ignore click-to-toggle if the user was dragging.
+    handle.addEventListener("click", (e) => {
+      if (e.target.closest("[data-f=minmax]")) return;
+      if (moved) {
+        moved = false;
+        return;
+      }
+      if (state.minimized) setMinimized(panel, false);
+    });
+  }
+
+  // Refresh all the live bits of the panel (stats, buttons, mini status).
   function render() {
     const el = document.getElementById("x-block-list-panel");
     if (!el) return;
@@ -644,6 +846,21 @@
     el.querySelector("[data-f=action]").textContent =
       "Status: " + state.lastAction + (state.lastDetail ? " — " + state.lastDetail : "");
 
+    const mini = el.querySelector("[data-f=mini-status]");
+    if (mini) {
+      const mode = primaryMode();
+      const modeLabel =
+        mode === "pause" ? "running" : mode === "resume" ? "paused" : state.lastAction;
+      mini.textContent =
+        state.index +
+        "/" +
+        total +
+        " · blocked " +
+        state.blocked +
+        " · " +
+        modeLabel;
+    }
+
     const primary = el.querySelector("[data-f=primary]");
     const mode = primaryMode();
     if (primary) {
@@ -657,6 +874,7 @@
     el.querySelector("[data-f=clearcache]").disabled = state.running;
   }
 
+  // Build the floating panel once (HTML + styles + button handlers).
   function ensurePanel() {
     if (document.getElementById("x-block-list-panel")) return;
 
@@ -664,6 +882,71 @@
     panel.id = "x-block-list-panel";
     panel.innerHTML = `
       <style>
+        #x-block-list-panel .xbl-chrome {
+          display: flex;
+          align-items: flex-start;
+          gap: 8px;
+          margin: -2px -2px 0 0;
+        }
+        #x-block-list-panel .xbl-drag {
+          flex: 1;
+          min-width: 0;
+          cursor: grab;
+          user-select: none;
+          padding-right: 4px;
+        }
+        #x-block-list-panel .xbl-drag.xbl-dragging {
+          cursor: grabbing;
+        }
+        #x-block-list-panel .xbl-title {
+          font: 600 13px/1.3 system-ui,sans-serif;
+        }
+        #x-block-list-panel .xbl-mini-status {
+          display: none;
+          margin-top: 2px;
+          font: 11px/1.35 system-ui,sans-serif;
+          opacity: .7;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        #x-block-list-panel.xbl-minimized .xbl-mini-status {
+          display: block;
+        }
+        #x-block-list-panel.xbl-minimized .xbl-body {
+          display: none;
+        }
+        #x-block-list-panel.xbl-minimized {
+          width: 200px;
+          max-width: calc(100vw - 24px);
+          padding: 8px 10px;
+        }
+        #x-block-list-panel.xbl-minimized .xbl-title {
+          font-size: 12px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        #x-block-list-panel button.xbl-minmax {
+          flex: 0 0 auto;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          margin-top: -1px;
+          padding: 0;
+          border: none;
+          border-radius: 6px;
+          background: transparent;
+          color: rgba(255,255,255,.45);
+          font: 500 15px/1 system-ui,sans-serif;
+          cursor: pointer;
+        }
+        #x-block-list-panel button.xbl-minmax:hover {
+          background: rgba(255,255,255,.08);
+          color: rgba(255,255,255,.9);
+        }
         #x-block-list-panel .xbl-actions {
           display: grid;
           grid-template-columns: 1.35fr 1fr;
@@ -733,42 +1016,50 @@
           text-decoration: underline;
         }
       </style>
-      <div style="font:600 13px/1.3 system-ui,sans-serif;margin-bottom:2px">Blocked for AI Reply</div>
-      <div data-f="subtitle" style="font:11px/1.35 system-ui,sans-serif;margin-bottom:8px;opacity:.7">
-        3,731 accounts · list by @levelsio
+      <div class="xbl-chrome">
+        <div class="xbl-drag" data-f="drag" title="Drag to move">
+          <div class="xbl-title">Blocked for AI Reply</div>
+          <div class="xbl-mini-status" data-f="mini-status"></div>
+        </div>
+        <button type="button" class="xbl-minmax" data-f="minmax" title="Minimize" aria-label="Minimize">–</button>
       </div>
-      <div data-f="progress" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:4px"></div>
-      <div data-f="stats" style="font:12px/1.45 system-ui,sans-serif;margin-bottom:4px;white-space:pre-line"></div>
-      <div data-f="action" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:10px;opacity:.85;word-break:break-word"></div>
-      <div class="xbl-actions">
-        <button data-f="primary" class="xbl-btn xbl-btn-primary">Start</button>
-        <button data-f="reset" class="xbl-btn xbl-btn-danger">Reset</button>
+      <div class="xbl-body" data-f="body">
+        <div data-f="subtitle" style="font:11px/1.35 system-ui,sans-serif;margin:6px 0 8px;opacity:.7">
+          3,731 accounts · list by @levelsio
+        </div>
+        <div data-f="progress" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:4px"></div>
+        <div data-f="stats" style="font:12px/1.45 system-ui,sans-serif;margin-bottom:4px;white-space:pre-line"></div>
+        <div data-f="action" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:10px;opacity:.85;word-break:break-word"></div>
+        <div class="xbl-actions">
+          <button data-f="primary" class="xbl-btn xbl-btn-primary">Start</button>
+          <button data-f="reset" class="xbl-btn xbl-btn-danger">Reset</button>
+        </div>
+        <div class="xbl-actions-secondary">
+          <button data-f="clearcache" class="xbl-btn">Clear cache</button>
+          <button data-f="clearlog" class="xbl-btn">Clear log</button>
+        </div>
+        <div style="font:11px/1.35 system-ui,sans-serif;margin-top:10px;opacity:.75">
+          Only blocks exact list handles. Stay on x.com while it runs. Reset progress keeps your blocked cache (faster re-runs).
+        </div>
+        <div style="font:10px/1.4 system-ui,sans-serif;margin-top:6px;opacity:.65">
+          Created by <a class="xbl-link" href="https://x.com/glaurossii" target="_blank" rel="noopener noreferrer">@glaurossi</a>
+          · blocklist by <a class="xbl-link" href="https://x.com/levelsio" target="_blank" rel="noopener noreferrer">@levelsio</a>
+        </div>
+        <pre data-f="log" style="
+          margin:8px 0 0;
+          padding:8px;
+          height:140px;
+          overflow:auto;
+          resize:vertical;
+          font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+          background:#0b0b0b;
+          color:#b6f5c8;
+          border:1px solid #222;
+          border-radius:6px;
+          white-space:pre-wrap;
+          word-break:break-word;
+        ">ready.</pre>
       </div>
-      <div class="xbl-actions-secondary">
-        <button data-f="clearcache" class="xbl-btn">Clear cache</button>
-        <button data-f="clearlog" class="xbl-btn">Clear log</button>
-      </div>
-      <div style="font:11px/1.35 system-ui,sans-serif;margin-top:10px;opacity:.75">
-        Only blocks exact list handles. Stay on x.com while it runs. Reset progress keeps your blocked cache (faster re-runs).
-      </div>
-      <div style="font:10px/1.4 system-ui,sans-serif;margin-top:6px;opacity:.65">
-        Created by <a class="xbl-link" href="https://x.com/glaurossii" target="_blank" rel="noopener noreferrer">@glaurossi</a>
-        · blocklist by <a class="xbl-link" href="https://x.com/levelsio" target="_blank" rel="noopener noreferrer">@levelsio</a>
-      </div>
-      <pre data-f="log" style="
-        margin:8px 0 0;
-        padding:8px;
-        height:140px;
-        overflow:auto;
-        resize:vertical;
-        font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-        background:#0b0b0b;
-        color:#b6f5c8;
-        border:1px solid #222;
-        border-radius:6px;
-        white-space:pre-wrap;
-        word-break:break-word;
-      ">ready.</pre>
     `;
     Object.assign(panel.style, {
       position: "fixed",
@@ -785,6 +1076,10 @@
       border: "1px solid rgba(255,255,255,.08)",
     });
 
+    panel.querySelector("[data-f=minmax]").addEventListener("click", (e) => {
+      e.stopPropagation();
+      setMinimized(panel, !state.minimized);
+    });
     panel.querySelector("[data-f=primary]").addEventListener("click", () => {
       if (state.running) requestPause();
       else runLoop();
@@ -819,13 +1114,44 @@
     });
 
     document.documentElement.appendChild(panel);
+    enablePanelDrag(panel);
+
+    const saved = loadUi();
+    if (saved) {
+      state.panelAnchor = saved.anchor === "bottom" ? "bottom" : "top";
+      panel.style.left = "auto";
+      if (typeof saved.right === "number") {
+        panel.style.right = saved.right + "px";
+      } else if (typeof saved.left === "number") {
+        // Older saves used left; convert on the fly.
+        panel.style.left = saved.left + "px";
+        panel.style.right = "auto";
+      }
+      if (state.panelAnchor === "bottom") {
+        panel.style.top = "auto";
+        panel.style.bottom =
+          typeof saved.bottom === "number" ? saved.bottom + "px" : "12px";
+      } else {
+        panel.style.bottom = "auto";
+        panel.style.top = typeof saved.top === "number" ? saved.top + "px" : "12px";
+      }
+      if (saved.minimized) setMinimized(panel, true);
+      else applyPanelAnchor(panel, state.panelAnchor);
+    } else {
+      applyPanelAnchor(panel, "bottom");
+    }
+
     log("panel ready · cache " + state.blockedCache.size);
     render();
   }
 
+  // Boot--
+
   loadBlockedCache();
   loadProgress();
   ensurePanel();
+
+  // Also expose the main actions from Tampermonkey's menu.
   GM_registerMenuCommand("Blocked for AI Reply: Start / Resume", () => {
     if (!state.running) runLoop();
   });
