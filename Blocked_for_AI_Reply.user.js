@@ -1,0 +1,841 @@
+// ==UserScript==
+// @name         Blocked for AI Reply
+// @namespace    https://local.x-block-list
+// @version      1.0.0
+// @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, cache + rate-limit aware
+// @author       glaurossi
+// @license      MIT
+// @match        https://x.com/*
+// @match        https://twitter.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @connect      blockedforaireply.levels.io
+// @connect      x.com
+// @connect      twitter.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const LIST_URL = "https://blockedforaireply.levels.io/api/usernames.txt";
+  const BEARER =
+    "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+  // X rotates GraphQL query IDs occasionally — if lookups start failing, update this.
+  const USER_BY_SCREEN_NAME_ID = "AMIBMjtxEEATh4z8V9GtRg";
+  const FEATURES = {
+    hidden_profile_subscriptions_enabled: true,
+    profile_label_improvements_pcf_label_in_post_enabled: true,
+    responsive_web_profile_redirect_enabled: false,
+    rweb_tipjar_consumption_enabled: true,
+    verified_phone_label_enabled: false,
+    subscriptions_verification_info_is_identity_verified_enabled: true,
+    subscriptions_verification_info_verified_since_enabled: true,
+    highlights_tweets_tab_ui_enabled: true,
+    responsive_web_twitter_article_notes_tab_enabled: true,
+    subscriptions_feature_can_gift_premium: true,
+    creator_subscriptions_tweet_preview_api_enabled: true,
+    responsive_web_graphql_timeline_navigation_enabled: true,
+  };
+  const FIELD_TOGGLES = {
+    withPayments: true,
+    withDmBlocks: true,
+    withAuxiliaryUserLabels: false,
+  };
+
+  const STORAGE_KEY = "xBlockListProgress_v1";
+  const CACHE_KEY = "xBlockListBlockedCache_v1";
+  const DELAY_MIN_MS = 3000;
+  const DELAY_MAX_MS = 5000;
+  const SKIP_DELAY_MS = 400; // after a network lookup that we intentionally skip
+  const CACHE_SKIP_DELAY_MS = 50; // known-blocked from local cache — no API call
+  const RATE_LIMIT_WAIT_MS = 15 * 60 * 1000;
+
+  const state = {
+    running: false,
+    stopping: false,
+    users: [],
+    index: 0,
+    blocked: 0,
+    skippedAlready: 0,
+    skippedMissing: 0,
+    skippedMismatch: 0,
+    skippedCached: 0,
+    failed: 0,
+    current: "",
+    lastAction: "idle",
+    lastDetail: "",
+    rateLimited: false,
+    logLines: [],
+    blockedCache: new Set(),
+  };
+
+  const LOG_MAX = 200;
+
+  function ts() {
+    return new Date().toLocaleTimeString(undefined, { hour12: false });
+  }
+
+  function log(msg) {
+    const line = "[" + ts() + "] " + msg;
+    state.logLines.push(line);
+    if (state.logLines.length > LOG_MAX) {
+      state.logLines.splice(0, state.logLines.length - LOG_MAX);
+    }
+    const box = document.querySelector("#x-block-list-panel [data-f=log]");
+    if (box) {
+      box.textContent = state.logLines.join("\n");
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  // CRITICAL: Tampermonkey sandbox fetch does NOT send x.com cookies.
+  // Must use the page's fetch so auth_token/ct0 session cookies apply.
+  function pageFetch(input, init) {
+    const w = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    return Promise.resolve()
+      .then(() => w.fetch.call(w, input, init))
+      .catch((e) => {
+        throw new Error(friendlyError(e));
+      });
+  }
+
+  function friendlyError(err) {
+    const msg = String(
+      err && err.message ? err.message : err && err.name ? err.name + ": " + err : err
+    );
+    if (
+      /Permission denied to access property ["']?body["']?/i.test(msg) ||
+      /Permission denied to access property ["']?fetch["']?/i.test(msg) ||
+      /Permission denied to access property ["']?cookie["']?/i.test(msg) ||
+      /Permission denied/i.test(msg)
+    ) {
+      return (
+        "Tampermonkey permission error. " +
+        "In the Tampermonkey extension settings, set “Run on sites with restrictions” to Allow, " +
+        "then refresh x.com and try again."
+      );
+    }
+    return msg;
+  }
+
+  function norm(name) {
+    return String(name || "").trim().toLowerCase();
+  }
+
+  function loadBlockedCache() {
+    try {
+      const raw = GM_getValue(CACHE_KEY, null);
+      if (!raw) return;
+      const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!Array.isArray(arr)) return;
+      state.blockedCache = new Set(arr.map(norm).filter(Boolean));
+    } catch (_) {}
+  }
+
+  function saveBlockedCache() {
+    GM_setValue(CACHE_KEY, JSON.stringify(Array.from(state.blockedCache)));
+  }
+
+  function rememberBlocked(username) {
+    const key = norm(username);
+    if (!key || state.blockedCache.has(key)) return;
+    state.blockedCache.add(key);
+    saveBlockedCache();
+  }
+
+  function loadProgress() {
+    try {
+      const raw = GM_getValue(STORAGE_KEY, null);
+      if (!raw) return;
+      const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (typeof p.index === "number") state.index = p.index;
+      state.blocked = p.blocked || 0;
+      state.skippedAlready = p.skippedAlready || 0;
+      state.skippedMissing = p.skippedMissing || 0;
+      state.skippedMismatch = p.skippedMismatch || 0;
+      state.skippedCached = p.skippedCached || 0;
+      state.failed = p.failed || 0;
+    } catch (_) {}
+  }
+
+  function saveProgress() {
+    GM_setValue(
+      STORAGE_KEY,
+      JSON.stringify({
+        index: state.index,
+        blocked: state.blocked,
+        skippedAlready: state.skippedAlready,
+        skippedMissing: state.skippedMissing,
+        skippedMismatch: state.skippedMismatch,
+        skippedCached: state.skippedCached,
+        failed: state.failed,
+        updatedAt: Date.now(),
+      })
+    );
+  }
+
+  function resetProgress() {
+    state.index = 0;
+    state.blocked = 0;
+    state.skippedAlready = 0;
+    state.skippedMissing = 0;
+    state.skippedMismatch = 0;
+    state.skippedCached = 0;
+    state.failed = 0;
+    state.current = "";
+    state.lastAction = "reset";
+    state.lastDetail = "";
+    saveProgress();
+    render();
+  }
+
+  function clearBlockedCache() {
+    state.blockedCache.clear();
+    saveBlockedCache();
+    log("blocked cache cleared");
+    render();
+  }
+
+  let sleepCanceler = null;
+
+  function sleep(ms) {
+    return new Promise((resolve) => {
+      const id = setTimeout(() => {
+        sleepCanceler = null;
+        resolve();
+      }, ms);
+      sleepCanceler = () => {
+        clearTimeout(id);
+        sleepCanceler = null;
+        resolve();
+      };
+    });
+  }
+
+  function abortSleep() {
+    if (sleepCanceler) sleepCanceler();
+  }
+
+  function requestPause() {
+    if (!state.running) return;
+    state.stopping = true;
+    state.lastAction = "pausing…";
+    log("pause requested");
+    abortSleep();
+    render();
+  }
+
+  function isFinished() {
+    return state.users.length > 0 && state.index >= state.users.length;
+  }
+
+  // idle → Start, running → Pause, paused mid-list → Resume, finished → Start
+  function primaryMode() {
+    if (state.running) return "pause";
+    if (state.index > 0 && !isFinished()) return "resume";
+    return "start";
+  }
+
+  function randDelay() {
+    return DELAY_MIN_MS + Math.floor(Math.random() * (DELAY_MAX_MS - DELAY_MIN_MS + 1));
+  }
+
+  function getCt0() {
+    const hit = document.cookie
+      .split(";")
+      .map((s) => s.trim())
+      .find((s) => s.startsWith("ct0="));
+    if (!hit) throw new Error("Missing ct0 cookie — are you logged in on x.com?");
+    return decodeURIComponent(hit.slice(4));
+  }
+
+  function authHeaders(formBody) {
+    const h = {
+      authorization: BEARER,
+      "x-csrf-token": getCt0(),
+      "x-twitter-auth-type": "OAuth2Session",
+      "x-twitter-active-user": "yes",
+      "x-twitter-client-language": "en",
+      accept: "*/*",
+    };
+    h["content-type"] = formBody
+      ? "application/x-www-form-urlencoded"
+      : "application/json";
+    return h;
+  }
+
+  function gmGet(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        anonymous: false,
+        onload: (res) => resolve(res),
+        onerror: (err) => reject(err),
+        ontimeout: () => reject(new Error("timeout")),
+      });
+    });
+  }
+
+  async function fetchUsernames() {
+    const res = await gmGet(LIST_URL);
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error("List download failed: HTTP " + res.status);
+    }
+    return String(res.responseText || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  async function lookupUser(screenName) {
+    try {
+      const variables = { screen_name: screenName, withSafetyModeUserFields: true };
+      const url =
+        "https://x.com/i/api/graphql/" +
+        USER_BY_SCREEN_NAME_ID +
+        "/UserByScreenName?variables=" +
+        encodeURIComponent(JSON.stringify(variables)) +
+        "&features=" +
+        encodeURIComponent(JSON.stringify(FEATURES)) +
+        "&fieldToggles=" +
+        encodeURIComponent(JSON.stringify(FIELD_TOGGLES));
+
+      const res = await pageFetch(url, {
+        credentials: "include",
+        headers: authHeaders(false),
+      });
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {}
+      return { status: res.status, json, text };
+    } catch (e) {
+      throw new Error(friendlyError(e));
+    }
+  }
+
+  async function blockUserId(userId) {
+    try {
+      const res = await pageFetch("https://x.com/i/api/1.1/blocks/create.json", {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders(true),
+        body: "user_id=" + encodeURIComponent(userId),
+      });
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {}
+      return { status: res.status, json, text };
+    } catch (e) {
+      throw new Error(friendlyError(e));
+    }
+  }
+
+  function isRateLimited(status, json, text) {
+    if (status === 429) return true;
+    const blob = JSON.stringify(json || {}) + (text || "");
+    return /rate.?limit|too many requests|StatusCode:429/i.test(blob);
+  }
+
+  function summarizeLookupFailure(look) {
+    if (!look) return "no response";
+    if (look.status === 401 || look.status === 403) {
+      return "HTTP " + look.status + " (auth/cookie issue)";
+    }
+    const errs = look.json && look.json.errors;
+    if (errs && errs.length) {
+      return "HTTP " + look.status + " errors: " + JSON.stringify(errs).slice(0, 160);
+    }
+    const result =
+      look.json &&
+      look.json.data &&
+      look.json.data.user &&
+      look.json.data.user.result;
+    if (result && result.__typename) {
+      return "typename=" + result.__typename;
+    }
+    if (!look.json) return "HTTP " + look.status + " non-JSON: " + String(look.text || "").slice(0, 80);
+    return "HTTP " + look.status + " empty user";
+  }
+
+  function extractScreenName(result) {
+    if (!result) return "";
+    if (result.legacy && result.legacy.screen_name) return result.legacy.screen_name;
+    if (result.core && result.core.screen_name) return result.core.screen_name;
+    return "";
+  }
+
+  function extractBlocking(result) {
+    if (!result) return false;
+    if (result.legacy && result.legacy.blocking === true) return true;
+    if (
+      result.relationship_perspectives &&
+      result.relationship_perspectives.blocking === true
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function extractUserId(result) {
+    if (!result) return null;
+    return result.rest_id || (result.legacy && result.legacy.id_str) || null;
+  }
+
+  async function waitOutRateLimit(reason) {
+    state.rateLimited = true;
+    state.lastAction = "rate_limit:" + reason;
+    render();
+    const until = Date.now() + RATE_LIMIT_WAIT_MS;
+    while (Date.now() < until) {
+      if (state.stopping) break;
+      const left = Math.ceil((until - Date.now()) / 1000);
+      state.lastAction = "rate_limit wait " + left + "s";
+      render();
+      await sleep(1000);
+    }
+    state.rateLimited = false;
+  }
+
+  async function processOne(username) {
+    state.current = username;
+    state.lastDetail = "";
+
+    // Local cache: handles we already blocked / confirmed blocked — no API call.
+    if (state.blockedCache.has(norm(username))) {
+      state.skippedCached++;
+      state.lastAction = "skip_cached";
+      log("skip cached @" + username);
+      return "advance_cache";
+    }
+
+    state.lastAction = "lookup";
+    log("lookup @" + username);
+    render();
+
+    const look = await lookupUser(username);
+    if (isRateLimited(look.status, look.json, look.text)) {
+      log("rate-limited on lookup @" + username + " — waiting 15m");
+      await waitOutRateLimit("lookup");
+      return "retry";
+    }
+
+    const result =
+      look.json &&
+      look.json.data &&
+      look.json.data.user &&
+      look.json.data.user.result;
+
+    const actual = extractScreenName(result);
+    const userId = extractUserId(result);
+
+    if (
+      !result ||
+      result.__typename === "UserUnavailable" ||
+      !actual ||
+      !userId
+    ) {
+      // Do NOT cache missing — suspended accounts can return / list can change.
+      state.skippedMissing++;
+      state.lastAction = "skip_missing";
+      state.lastDetail = summarizeLookupFailure(look);
+      log("skip missing @" + username + " — " + state.lastDetail);
+      return "advance_fast";
+    }
+
+    if (actual.toLowerCase() !== username.toLowerCase()) {
+      state.skippedMismatch++;
+      state.lastAction = "skip_mismatch:" + actual;
+      state.lastDetail = "";
+      log("skip mismatch @" + username + " → @" + actual);
+      return "advance_fast";
+    }
+
+    if (extractBlocking(result)) {
+      rememberBlocked(username);
+      state.skippedAlready++;
+      state.lastAction = "skip_already";
+      state.lastDetail = "";
+      log("skip already blocked @" + username);
+      return "advance_fast";
+    }
+
+    if (state.stopping) return "paused_mid";
+
+    state.lastAction = "block";
+    log("blocking @" + username + " (id " + userId + ")");
+    render();
+
+    const block = await blockUserId(userId);
+    if (isRateLimited(block.status, block.json, block.text)) {
+      log("rate-limited on block @" + username + " — waiting 15m");
+      await waitOutRateLimit("block");
+      return "retry";
+    }
+
+    const blockedName = block.json && block.json.screen_name;
+    if (
+      block.status >= 200 &&
+      block.status < 300 &&
+      blockedName &&
+      blockedName.toLowerCase() === username.toLowerCase()
+    ) {
+      rememberBlocked(username);
+      state.blocked++;
+      state.lastAction = "blocked";
+      state.lastDetail = "";
+      log("blocked @" + username);
+      return "advance";
+    }
+
+    const errMsg = JSON.stringify((block.json && block.json.errors) || block.text || "").slice(
+      0,
+      200
+    );
+    if (/already|blocked/i.test(errMsg)) {
+      rememberBlocked(username);
+      state.skippedAlready++;
+      state.lastAction = "skip_already_err";
+      state.lastDetail = "";
+      log("skip already blocked @" + username + " (api)");
+      return "advance_fast";
+    }
+
+    state.failed++;
+    state.lastAction = "fail";
+    state.lastDetail = "HTTP " + block.status + " " + errMsg;
+    log("FAIL @" + username + " — " + state.lastDetail);
+    return "advance";
+  }
+
+  async function runLoop() {
+    if (state.running) return;
+
+    // Finished list → start over from top (keeps blocked cache)
+    if (isFinished()) {
+      log("list finished — resetting progress to start again");
+      resetProgress();
+    }
+
+    state.running = true;
+    state.stopping = false;
+    state.lastAction = "starting";
+    log(
+      "starting from index " +
+        state.index +
+        " · blocked-cache " +
+        state.blockedCache.size
+    );
+    render();
+
+    try {
+      getCt0();
+      if (!document.cookie.includes("ct0=")) {
+        throw new Error("Not logged in (no ct0)");
+      }
+
+      if (!state.users.length) {
+        state.lastAction = "downloading list";
+        log("downloading username list…");
+        render();
+        state.users = await fetchUsernames();
+        log("loaded " + state.users.length + " usernames");
+        render();
+      }
+
+      while (state.index < state.users.length) {
+        if (state.stopping) break;
+
+        const username = state.users[state.index];
+        let outcome;
+        try {
+          outcome = await processOne(username);
+        } catch (e) {
+          state.failed++;
+          state.lastAction = "exception";
+          state.lastDetail = friendlyError(e).slice(0, 220);
+          log("exception @" + username + " — " + state.lastDetail);
+          outcome = "advance";
+        }
+
+        if (outcome === "retry") continue;
+        if (outcome === "paused_mid") break; // same index on resume
+
+        state.index++;
+        saveProgress();
+        render();
+
+        if (state.stopping) break;
+
+        let delay = randDelay();
+        if (outcome === "advance_cache") delay = CACHE_SKIP_DELAY_MS;
+        else if (outcome === "advance_fast") delay = SKIP_DELAY_MS;
+        await sleep(delay);
+      }
+
+      state.lastAction = state.stopping ? "paused" : "finished";
+      log(state.stopping ? "paused at index " + state.index : "finished");
+    } catch (e) {
+      state.lastAction = "error";
+      state.lastDetail = friendlyError(e).slice(0, 220);
+      log("error — " + state.lastDetail);
+    } finally {
+      state.running = false;
+      state.stopping = false;
+      state.current = "";
+      abortSleep();
+      saveProgress();
+      render();
+    }
+  }
+
+  function skippedTotal() {
+    return (
+      state.skippedAlready +
+      state.skippedMissing +
+      state.skippedMismatch +
+      state.skippedCached
+    );
+  }
+
+  function formatCount(n) {
+    return Number(n).toLocaleString();
+  }
+
+  function render() {
+    const el = document.getElementById("x-block-list-panel");
+    if (!el) return;
+    const total = state.users.length || "?";
+    const sub = el.querySelector("[data-f=subtitle]");
+    if (sub) {
+      const n = state.users.length
+        ? formatCount(state.users.length)
+        : "3,731+";
+      sub.textContent =
+        n +
+        " accounts · list by @levelsio · cache " +
+        formatCount(state.blockedCache.size);
+    }
+    el.querySelector("[data-f=stats]").textContent =
+      "Blocked: " +
+      state.blocked +
+      "\nSkipped: " +
+      skippedTotal() +
+      " (already " +
+      state.skippedAlready +
+      ", missing " +
+      state.skippedMissing +
+      ", mismatch " +
+      state.skippedMismatch +
+      ", cached " +
+      state.skippedCached +
+      ")\nFailed: " +
+      state.failed;
+    el.querySelector("[data-f=progress]").textContent =
+      "Progress: " + state.index + " / " + total + (state.current ? " — @" + state.current : "");
+    el.querySelector("[data-f=action]").textContent =
+      "Status: " + state.lastAction + (state.lastDetail ? " — " + state.lastDetail : "");
+
+    const primary = el.querySelector("[data-f=primary]");
+    const mode = primaryMode();
+    if (primary) {
+      primary.textContent =
+        mode === "pause" ? "Pause" : mode === "resume" ? "Resume" : "Start";
+      primary.classList.toggle("xbl-btn-primary", mode !== "pause");
+      primary.classList.toggle("xbl-btn-warn", mode === "pause");
+      primary.disabled = false;
+    }
+    el.querySelector("[data-f=reset]").disabled = state.running;
+    el.querySelector("[data-f=clearcache]").disabled = state.running;
+  }
+
+  function ensurePanel() {
+    if (document.getElementById("x-block-list-panel")) return;
+
+    const panel = document.createElement("div");
+    panel.id = "x-block-list-panel";
+    panel.innerHTML = `
+      <style>
+        #x-block-list-panel .xbl-actions {
+          display: grid;
+          grid-template-columns: 1.35fr 1fr;
+          gap: 8px;
+          margin-bottom: 2px;
+        }
+        #x-block-list-panel .xbl-actions-secondary {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+          margin-top: 8px;
+        }
+        #x-block-list-panel button.xbl-btn {
+          appearance: none;
+          border: 1px solid rgba(255,255,255,.14);
+          border-radius: 8px;
+          padding: 8px 10px;
+          font: 600 12px/1.2 system-ui,sans-serif;
+          color: #fff;
+          background: rgba(255,255,255,.08);
+          cursor: pointer;
+          transition: background .15s ease, border-color .15s ease, opacity .15s ease, transform .1s ease;
+        }
+        #x-block-list-panel button.xbl-btn:hover:not(:disabled) {
+          background: rgba(255,255,255,.14);
+          border-color: rgba(255,255,255,.28);
+        }
+        #x-block-list-panel button.xbl-btn:active:not(:disabled) {
+          transform: translateY(1px);
+        }
+        #x-block-list-panel button.xbl-btn:disabled {
+          opacity: .38;
+          cursor: not-allowed;
+        }
+        #x-block-list-panel button.xbl-btn-primary {
+          background: #1d9bf0;
+          border-color: #1d9bf0;
+          color: #fff;
+        }
+        #x-block-list-panel button.xbl-btn-primary:hover:not(:disabled) {
+          background: #1a8cd8;
+          border-color: #1a8cd8;
+        }
+        #x-block-list-panel button.xbl-btn-danger {
+          background: rgba(244, 33, 46, .12);
+          border-color: rgba(244, 33, 46, .35);
+          color: #ff8a93;
+        }
+        #x-block-list-panel button.xbl-btn-danger:hover:not(:disabled) {
+          background: rgba(244, 33, 46, .2);
+          border-color: rgba(244, 33, 46, .5);
+        }
+        #x-block-list-panel button.xbl-btn-warn {
+          background: rgba(255, 212, 0, .14);
+          border-color: rgba(255, 212, 0, .4);
+          color: #ffe566;
+        }
+        #x-block-list-panel button.xbl-btn-warn:hover:not(:disabled) {
+          background: rgba(255, 212, 0, .22);
+          border-color: rgba(255, 212, 0, .55);
+        }
+        #x-block-list-panel a.xbl-link {
+          color: #8ecfff;
+          text-decoration: none;
+        }
+        #x-block-list-panel a.xbl-link:hover {
+          text-decoration: underline;
+        }
+      </style>
+      <div style="font:600 13px/1.3 system-ui,sans-serif;margin-bottom:2px">Blocked for AI Reply</div>
+      <div data-f="subtitle" style="font:11px/1.35 system-ui,sans-serif;margin-bottom:8px;opacity:.7">
+        3,731 accounts · list by @levelsio
+      </div>
+      <div data-f="progress" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:4px"></div>
+      <div data-f="stats" style="font:12px/1.45 system-ui,sans-serif;margin-bottom:4px;white-space:pre-line"></div>
+      <div data-f="action" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:10px;opacity:.85;word-break:break-word"></div>
+      <div class="xbl-actions">
+        <button data-f="primary" class="xbl-btn xbl-btn-primary">Start</button>
+        <button data-f="reset" class="xbl-btn xbl-btn-danger">Reset</button>
+      </div>
+      <div class="xbl-actions-secondary">
+        <button data-f="clearcache" class="xbl-btn">Clear cache</button>
+        <button data-f="clearlog" class="xbl-btn">Clear log</button>
+      </div>
+      <div style="font:11px/1.35 system-ui,sans-serif;margin-top:10px;opacity:.75">
+        Only blocks exact list handles. Stay on x.com while it runs. Reset progress keeps your blocked cache (faster re-runs).
+      </div>
+      <div style="font:10px/1.4 system-ui,sans-serif;margin-top:6px;opacity:.65">
+        Created by <a class="xbl-link" href="https://x.com/glaurossii" target="_blank" rel="noopener noreferrer">@glaurossi</a>
+        · blocklist by <a class="xbl-link" href="https://x.com/levelsio" target="_blank" rel="noopener noreferrer">@levelsio</a>
+      </div>
+      <pre data-f="log" style="
+        margin:8px 0 0;
+        padding:8px;
+        height:140px;
+        overflow:auto;
+        resize:vertical;
+        font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+        background:#0b0b0b;
+        color:#b6f5c8;
+        border:1px solid #222;
+        border-radius:6px;
+        white-space:pre-wrap;
+        word-break:break-word;
+      ">ready.</pre>
+    `;
+    Object.assign(panel.style, {
+      position: "fixed",
+      right: "12px",
+      bottom: "12px",
+      zIndex: "2147483646",
+      width: "395px",
+      maxWidth: "calc(100vw - 24px)",
+      padding: "12px",
+      borderRadius: "12px",
+      background: "rgba(0,0,0,.92)",
+      color: "#fff",
+      boxShadow: "0 8px 28px rgba(0,0,0,.35)",
+      border: "1px solid rgba(255,255,255,.08)",
+    });
+
+    panel.querySelector("[data-f=primary]").addEventListener("click", () => {
+      if (state.running) requestPause();
+      else runLoop();
+    });
+    panel.querySelector("[data-f=reset]").addEventListener("click", () => {
+      if (state.running) return;
+      if (
+        confirm(
+          "Reset progress counters and start index to 0?\n\nYour blocked cache is kept so re-runs stay fast."
+        )
+      ) {
+        resetProgress();
+        log("progress reset (blocked cache kept: " + state.blockedCache.size + ")");
+      }
+    });
+    panel.querySelector("[data-f=clearcache]").addEventListener("click", () => {
+      if (state.running) return;
+      if (
+        confirm(
+          "Clear the local blocked cache (" +
+            state.blockedCache.size +
+            " handles)?\n\nNext run will re-lookup those accounts."
+        )
+      ) {
+        clearBlockedCache();
+      }
+    });
+    panel.querySelector("[data-f=clearlog]").addEventListener("click", () => {
+      state.logLines = [];
+      const box = panel.querySelector("[data-f=log]");
+      if (box) box.textContent = "log cleared.";
+    });
+
+    document.documentElement.appendChild(panel);
+    log("panel ready · cache " + state.blockedCache.size);
+    render();
+  }
+
+  loadBlockedCache();
+  loadProgress();
+  ensurePanel();
+  GM_registerMenuCommand("Blocked for AI Reply: Start / Resume", () => {
+    if (!state.running) runLoop();
+  });
+  GM_registerMenuCommand("Blocked for AI Reply: Pause", () => {
+    requestPause();
+  });
+  GM_registerMenuCommand("Blocked for AI Reply: Reset progress", () => {
+    if (!state.running) resetProgress();
+  });
+  GM_registerMenuCommand("Blocked for AI Reply: Clear blocked cache", () => {
+    if (!state.running) clearBlockedCache();
+  });
+})();
