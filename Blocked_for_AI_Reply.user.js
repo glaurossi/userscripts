@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Blocked for AI Reply
 // @namespace    https://local.x-block-list
-// @version      1.2.0
-// @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, cache + rate-limit aware
+// @version      1.3.0
+// @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, unblock if removed from list, cache + rate-limit aware
 // @author       glaurossi
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/glaurossi/userscripts/main/Blocked_for_AI_Reply.user.js
@@ -73,6 +73,7 @@
     users: [],
     index: 0,
     blocked: 0,
+    unblocked: 0,
     skippedAlready: 0,
     skippedMissing: 0,
     skippedMismatch: 0,
@@ -168,6 +169,14 @@
     saveBlockedCache();
   }
 
+  // Drop a handle from cache after unblock / confirmed no longer blocked.
+  function forgetBlocked(username) {
+    const key = norm(username);
+    if (!key || !state.blockedCache.has(key)) return;
+    state.blockedCache.delete(key);
+    saveBlockedCache();
+  }
+
   function loadProgress() {
     try {
       const raw = GM_getValue(STORAGE_KEY, null);
@@ -175,6 +184,7 @@
       const p = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (typeof p.index === "number") state.index = p.index;
       state.blocked = p.blocked || 0;
+      state.unblocked = p.unblocked || 0;
       state.skippedAlready = p.skippedAlready || 0;
       state.skippedMissing = p.skippedMissing || 0;
       state.skippedMismatch = p.skippedMismatch || 0;
@@ -189,6 +199,7 @@
       JSON.stringify({
         index: state.index,
         blocked: state.blocked,
+        unblocked: state.unblocked,
         skippedAlready: state.skippedAlready,
         skippedMissing: state.skippedMissing,
         skippedMismatch: state.skippedMismatch,
@@ -203,6 +214,7 @@
   function resetProgress() {
     state.index = 0;
     state.blocked = 0;
+    state.unblocked = 0;
     state.skippedAlready = 0;
     state.skippedMissing = 0;
     state.skippedMismatch = 0;
@@ -353,6 +365,26 @@
   async function blockUserId(userId) {
     try {
       const res = await pageFetch("https://x.com/i/api/1.1/blocks/create.json", {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders(true),
+        body: "user_id=" + encodeURIComponent(userId),
+      });
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {}
+      return { status: res.status, json, text };
+    } catch (e) {
+      throw new Error(friendlyError(e));
+    }
+  }
+
+  // Remove a block — used when a cached handle is no longer on the list.
+  async function unblockUserId(userId) {
+    try {
+      const res = await pageFetch("https://x.com/i/api/1.1/blocks/destroy.json", {
         method: "POST",
         credentials: "include",
         headers: authHeaders(true),
@@ -553,6 +585,110 @@
     return "advance";
   }
 
+  // Cache handles that are no longer on the live list → candidates to unblock.
+  function cacheHandlesNotOnList() {
+    const onList = new Set(state.users.map(norm));
+    return Array.from(state.blockedCache).filter((u) => !onList.has(u));
+  }
+
+  // Unblock one cached handle that left the list. Same outcome codes as processOne.
+  async function processUnblockOne(username) {
+    state.current = username;
+    state.lastDetail = "";
+    state.lastAction = "lookup_unblock";
+    log("lookup (unblock) @" + username);
+    render();
+
+    const look = await lookupUser(username);
+    if (isRateLimited(look.status, look.json, look.text)) {
+      log("rate-limited on unblock-lookup @" + username + " — waiting 15m");
+      await waitOutRateLimit("unblock_lookup");
+      return "retry";
+    }
+
+    const result =
+      look.json &&
+      look.json.data &&
+      look.json.data.user &&
+      look.json.data.user.result;
+
+    const actual = extractScreenName(result);
+    const userId = extractUserId(result);
+
+    if (
+      !result ||
+      result.__typename === "UserUnavailable" ||
+      !actual ||
+      !userId
+    ) {
+      // Gone / unavailable — drop from cache; nothing left to unblock.
+      forgetBlocked(username);
+      state.lastAction = "unblock_skip_missing";
+      state.lastDetail = summarizeLookupFailure(look);
+      log("unblock skip missing @" + username + " — dropped from cache");
+      return "advance_fast";
+    }
+
+    if (actual.toLowerCase() !== username.toLowerCase()) {
+      forgetBlocked(username);
+      state.lastAction = "unblock_skip_mismatch:" + actual;
+      log("unblock skip mismatch @" + username + " → @" + actual + " — dropped from cache");
+      return "advance_fast";
+    }
+
+    if (!extractBlocking(result)) {
+      forgetBlocked(username);
+      state.lastAction = "unblock_already";
+      log("already unblocked @" + username + " — dropped from cache");
+      return "advance_fast";
+    }
+
+    if (state.stopping) return "paused_mid";
+
+    state.lastAction = "unblock";
+    log("unblocking @" + username + " (id " + userId + ")");
+    render();
+
+    const unb = await unblockUserId(userId);
+    if (isRateLimited(unb.status, unb.json, unb.text)) {
+      log("rate-limited on unblock @" + username + " — waiting 15m");
+      await waitOutRateLimit("unblock");
+      return "retry";
+    }
+
+    const unblockedName = unb.json && unb.json.screen_name;
+    if (
+      unb.status >= 200 &&
+      unb.status < 300 &&
+      unblockedName &&
+      unblockedName.toLowerCase() === username.toLowerCase()
+    ) {
+      forgetBlocked(username);
+      state.unblocked++;
+      state.lastAction = "unblocked";
+      state.lastDetail = "";
+      log("unblocked @" + username);
+      return "advance";
+    }
+
+    const errMsg = JSON.stringify((unb.json && unb.json.errors) || unb.text || "").slice(
+      0,
+      200
+    );
+    if (/not blocking|you are not blocking|not blocked/i.test(errMsg)) {
+      forgetBlocked(username);
+      state.lastAction = "unblock_already_err";
+      log("already unblocked @" + username + " (api) — dropped from cache");
+      return "advance_fast";
+    }
+
+    state.failed++;
+    state.lastAction = "unblock_fail";
+    state.lastDetail = "HTTP " + unb.status + " " + errMsg;
+    log("FAIL unblock @" + username + " — " + state.lastDetail);
+    return "advance";
+  }
+
   // Main loop
 
   async function runLoop() {
@@ -581,15 +717,61 @@
         throw new Error("Not logged in (no ct0)");
       }
 
-      if (!state.users.length) {
-        state.lastAction = "downloading list";
-        log("downloading username list…");
-        render();
-        state.users = await fetchUsernames();
-        log("loaded " + state.users.length + " usernames");
-        render();
+      // Always refresh so removals from the live list can be unblocked.
+      state.lastAction = "downloading list";
+      log("downloading username list…");
+      render();
+      state.users = await fetchUsernames();
+      log("loaded " + state.users.length + " usernames");
+      render();
+
+      // Phase 1: unblock cached handles that left the list (cache shrinks as we go).
+      const removed = cacheHandlesNotOnList();
+      if (removed.length) {
+        log("unban check — " + removed.length + " cached handle(s) no longer on list");
+        for (let i = 0; i < removed.length; i++) {
+          if (state.stopping) break;
+          // Re-check: may already have been cleared on a prior resume.
+          if (!state.blockedCache.has(norm(removed[i]))) continue;
+
+          const username = removed[i];
+          let outcome;
+          try {
+            outcome = await processUnblockOne(username);
+          } catch (e) {
+            state.failed++;
+            state.lastAction = "unblock_exception";
+            state.lastDetail = friendlyError(e).slice(0, 220);
+            log("exception unblock @" + username + " — " + state.lastDetail);
+            outcome = "advance";
+          }
+
+          if (outcome === "retry") {
+            i--; // same handle after rate-limit wait
+            continue;
+          }
+          if (outcome === "paused_mid") break;
+
+          saveProgress();
+          render();
+
+          if (state.stopping) break;
+
+          let delay = randDelay();
+          if (outcome === "advance_fast") delay = SKIP_DELAY_MS;
+          await sleep(delay);
+        }
+      } else {
+        log("unban check — none to unblock");
       }
 
+      if (state.stopping) {
+        state.lastAction = "paused";
+        log("paused at index " + state.index);
+        return;
+      }
+
+      // Phase 2: block remaining list entries from current index.
       while (state.index < state.users.length) {
         if (state.stopping) break;
 
@@ -829,6 +1011,8 @@
     el.querySelector("[data-f=stats]").textContent =
       "Blocked: " +
       state.blocked +
+      "\nUnblocked: " +
+      state.unblocked +
       "\nSkipped: " +
       skippedTotal() +
       " (already " +
@@ -857,6 +1041,8 @@
         total +
         " · blocked " +
         state.blocked +
+        " · unblocked " +
+        state.unblocked +
         " · " +
         modeLabel;
     }
@@ -1039,7 +1225,7 @@
           <button data-f="clearlog" class="xbl-btn">Clear log</button>
         </div>
         <div style="font:11px/1.35 system-ui,sans-serif;margin-top:10px;opacity:.75">
-          Only blocks exact list handles. Stay on x.com while it runs. Reset progress keeps your blocked cache (faster re-runs).
+          Blocks exact list handles; unblocks cached ones removed from the list. Stay on x.com while it runs. Reset keeps your blocked cache.
         </div>
         <div style="font:10px/1.4 system-ui,sans-serif;margin-top:6px;opacity:.65">
           Created by <a class="xbl-link" href="https://x.com/glaurossii" target="_blank" rel="noopener noreferrer">@glaurossi</a>
