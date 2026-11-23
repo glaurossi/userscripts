@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Blocked for AI Reply
 // @namespace    https://local.x-block-list
-// @version      1.3.0
+// @version      1.3.1
 // @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, unblock if removed from list, cache + rate-limit aware
 // @author       glaurossi
 // @license      MIT
@@ -14,7 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// @connect      blockedforaireply.levels.io
+// @connect      blockedforaireply.com
 // @connect      x.com
 // @connect      twitter.com
 // @run-at       document-idle
@@ -26,7 +26,7 @@
   // Config
 
   // Plain-text list from levelsio (one username per line).
-  const LIST_URL = "https://blockedforaireply.levels.io/api/usernames.txt";
+  const LIST_URL = "https://blockedforaireply.com/api/usernames.txt";
   // Public X web client bearer — not a user secret.
   const BEARER =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
