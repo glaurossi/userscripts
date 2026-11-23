@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Blocked for AI Reply
 // @namespace    https://local.x-block-list
-// @version      1.3.1
-// @description  Block the levels.io “Blocked for AI Reply” spam list on X — verify handle, skip missing/already-blocked, unblock if removed from list, cache + rate-limit aware
+// @version      1.4.3
+// @description  Block the levels.io “Blocked for AI Reply” spam list on X — block by user ID, skip missing/already-blocked, unblock if removed from list, cache + rate-limit aware
 // @author       glaurossi
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/glaurossi/userscripts/main/Blocked_for_AI_Reply.user.js
@@ -13,7 +13,6 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @grant        unsafeWindow
 // @connect      blockedforaireply.com
 // @connect      x.com
 // @connect      twitter.com
@@ -25,14 +24,14 @@
 
   // Config
 
-  // Plain-text list from levelsio (one username per line).
-  const LIST_URL = "https://blockedforaireply.com/api/usernames.txt";
+  // Plain-text list from levelsio (one numeric user ID per line).
+  const LIST_URL = "https://blockedforaireply.com/api/ids.txt";
   // Public X web client bearer — not a user secret.
   const BEARER =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
   // X rotates GraphQL query IDs occasionally — if lookups start failing, update this.
-  const USER_BY_SCREEN_NAME_ID = "AMIBMjtxEEATh4z8V9GtRg";
-  // Feature flags the UserByScreenName query expects.
+  const USER_BY_REST_ID = "mxaYWwt52eAb6OAzYHMVzg";
+  // Feature flags the UserByRestId query expects.
   const FEATURES = {
     hidden_profile_subscriptions_enabled: true,
     profile_label_improvements_pcf_label_in_post_enabled: true,
@@ -54,8 +53,9 @@
   };
 
   // Tampermonkey storage keys (progress, block cache, panel position).
+  // Cache v2 stores numeric user IDs (v1 was handles).
   const STORAGE_KEY = "xBlockListProgress_v1";
-  const CACHE_KEY = "xBlockListBlockedCache_v1";
+  const CACHE_KEY = "xBlockListBlockedCache_v2";
   const UI_KEY = "xBlockListUi_v1";
 
   // Pacing: real blocks wait 3–5s; skips are faster so re-runs don't drag.
@@ -111,39 +111,55 @@
     }
   }
 
-  // CRITICAL: Tampermonkey sandbox fetch does NOT send x.com cookies.
-  // Must use the page's fetch so auth_token/ct0 session cookies apply.
-  function pageFetch(input, init) {
-    const w = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-    return Promise.resolve()
-      .then(() => w.fetch.call(w, input, init))
-      .catch((e) => {
-        throw new Error(friendlyError(e));
-      });
-  }
-
-  // Turn cryptic browser/TM errors into something a human can act on.
   function friendlyError(err) {
-    const msg = String(
+    return String(
       err && err.message ? err.message : err && err.name ? err.name + ": " + err : err
     );
-    if (
-      /Permission denied to access property ["']?body["']?/i.test(msg) ||
-      /Permission denied to access property ["']?fetch["']?/i.test(msg) ||
-      /Permission denied to access property ["']?cookie["']?/i.test(msg) ||
-      /Permission denied/i.test(msg)
-    ) {
-      return (
-        "Tampermonkey permission error. " +
-        "In the Tampermonkey extension settings, set “Run on sites with restrictions” to Allow, " +
-        "then refresh x.com and try again."
-      );
-    }
-    return msg;
   }
 
-  function norm(name) {
-    return String(name || "").trim().toLowerCase();
+  // GM_xmlhttpRequest keeps session cookies without needing page-realm fetch.
+  function pageFetch(url, init) {
+    const method = (init && init.method) || "GET";
+    const headers = Object.assign(
+      {
+        // Match what the web app sends so X accepts the session.
+        referer: "https://x.com/",
+        origin: "https://x.com",
+      },
+      (init && init.headers) || {}
+    );
+
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url: String(url),
+        headers,
+        data: init && init.body != null ? init.body : undefined,
+        anonymous: false,
+        onload: (res) => {
+          resolve({
+            status: res.status || 0,
+            text: res.responseText == null ? "" : String(res.responseText),
+          });
+        },
+        onerror: () => reject(new Error("X API request failed (network)")),
+        ontimeout: () => reject(new Error("X API request timed out")),
+      });
+    });
+  }
+
+  // Normalize a list / cache user ID (digits only).
+  function normId(id) {
+    const s = String(id || "").trim();
+    return /^\d+$/.test(s) ? s : "";
+  }
+
+  // Log / progress label: "@handle (id …)" when known, else "id …".
+  function userLabel(userId, screenName) {
+    const id = normId(userId) || String(userId || "");
+    const handle = String(screenName || "").trim();
+    if (handle) return "@" + handle + " (id " + id + ")";
+    return "id " + id;
   }
 
   // Persistence: block cache + progress
@@ -153,7 +169,7 @@
       if (!raw) return;
       const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (!Array.isArray(arr)) return;
-      state.blockedCache = new Set(arr.map(norm).filter(Boolean));
+      state.blockedCache = new Set(arr.map(normId).filter(Boolean));
     } catch (_) {}
   }
 
@@ -161,17 +177,17 @@
     GM_setValue(CACHE_KEY, JSON.stringify(Array.from(state.blockedCache)));
   }
 
-  // Remember a handle we blocked (or confirmed already blocked) for fast re-runs.
-  function rememberBlocked(username) {
-    const key = norm(username);
+  // Remember an ID we blocked (or confirmed already blocked) for fast re-runs.
+  function rememberBlocked(userId) {
+    const key = normId(userId);
     if (!key || state.blockedCache.has(key)) return;
     state.blockedCache.add(key);
     saveBlockedCache();
   }
 
-  // Drop a handle from cache after unblock / confirmed no longer blocked.
-  function forgetBlocked(username) {
-    const key = norm(username);
+  // Drop an ID from cache after unblock / confirmed no longer blocked.
+  function forgetBlocked(userId) {
+    const key = normId(userId);
     if (!key || !state.blockedCache.has(key)) return;
     state.blockedCache.delete(key);
     saveBlockedCache();
@@ -210,7 +226,7 @@
     );
   }
 
-  // Counters/index only — does not wipe the blocked-handle cache.
+  // Counters/index only — does not wipe the blocked-ID cache.
   function resetProgress() {
     state.index = 0;
     state.blocked = 0;
@@ -321,25 +337,25 @@
     });
   }
 
-  async function fetchUsernames() {
+  async function fetchUserIds() {
     const res = await gmGet(LIST_URL);
     if (res.status < 200 || res.status >= 300) {
       throw new Error("List download failed: HTTP " + res.status);
     }
     return String(res.responseText || "")
       .split(/\r?\n/)
-      .map((s) => s.trim())
+      .map((s) => normId(s))
       .filter(Boolean);
   }
 
-  // Resolve a screen name → user object (and whether we already block them).
-  async function lookupUser(screenName) {
+  // Resolve a user ID → user object (handle + whether we already block them).
+  async function lookupUser(userId) {
     try {
-      const variables = { screen_name: screenName, withSafetyModeUserFields: true };
+      const variables = { userId: String(userId), withSafetyModeUserFields: true };
       const url =
         "https://x.com/i/api/graphql/" +
-        USER_BY_SCREEN_NAME_ID +
-        "/UserByScreenName?variables=" +
+        USER_BY_REST_ID +
+        "/UserByRestId?variables=" +
         encodeURIComponent(JSON.stringify(variables)) +
         "&features=" +
         encodeURIComponent(JSON.stringify(FEATURES)) +
@@ -350,7 +366,7 @@
         credentials: "include",
         headers: authHeaders(false),
       });
-      const text = await res.text();
+      const text = res.text;
       let json = null;
       try {
         json = JSON.parse(text);
@@ -361,7 +377,7 @@
     }
   }
 
-  // Actually create the block — only called after handle verification.
+  // Actually create the block — only called after ID lookup.
   async function blockUserId(userId) {
     try {
       const res = await pageFetch("https://x.com/i/api/1.1/blocks/create.json", {
@@ -370,7 +386,7 @@
         headers: authHeaders(true),
         body: "user_id=" + encodeURIComponent(userId),
       });
-      const text = await res.text();
+      const text = res.text;
       let json = null;
       try {
         json = JSON.parse(text);
@@ -381,7 +397,7 @@
     }
   }
 
-  // Remove a block — used when a cached handle is no longer on the list.
+  // Remove a block — used when a cached ID is no longer on the list.
   async function unblockUserId(userId) {
     try {
       const res = await pageFetch("https://x.com/i/api/1.1/blocks/destroy.json", {
@@ -390,7 +406,7 @@
         headers: authHeaders(true),
         body: "user_id=" + encodeURIComponent(userId),
       });
-      const text = await res.text();
+      const text = res.text;
       let json = null;
       try {
         json = JSON.parse(text);
@@ -468,29 +484,30 @@
     state.rateLimited = false;
   }
 
-  // Per-username pipeline
+  // Per-ID pipeline
   // Returns how the main loop should advance:
   // advance / advance_fast / advance_cache / retry / paused_mid
 
-  async function processOne(username) {
-    state.current = username;
+  async function processOne(userId) {
+    const id = normId(userId);
+    state.current = id;
     state.lastDetail = "";
 
-    // Local cache: handles we already blocked / confirmed blocked — no API call.
-    if (state.blockedCache.has(norm(username))) {
+    // Local cache: IDs we already blocked / confirmed blocked — no API call.
+    if (state.blockedCache.has(id)) {
       state.skippedCached++;
       state.lastAction = "skip_cached";
-      log("skip cached @" + username);
+      log("skip cached id " + id);
       return "advance_cache";
     }
 
     state.lastAction = "lookup";
-    log("lookup @" + username);
+    log("lookup id " + id);
     render();
 
-    const look = await lookupUser(username);
+    const look = await lookupUser(id);
     if (isRateLimited(look.status, look.json, look.text)) {
-      log("rate-limited on lookup @" + username + " — waiting 15m");
+      log("rate-limited on lookup id " + id + " — waiting 15m");
       await waitOutRateLimit("lookup");
       return "retry";
     }
@@ -501,38 +518,40 @@
       look.json.data.user &&
       look.json.data.user.result;
 
-    const actual = extractScreenName(result);
-    const userId = extractUserId(result);
+    const handle = extractScreenName(result);
+    const resolvedId = extractUserId(result);
+    const label = userLabel(id, handle);
 
     if (
       !result ||
       result.__typename === "UserUnavailable" ||
-      !actual ||
-      !userId
+      !resolvedId
     ) {
       // Do NOT cache missing — suspended accounts can return / list can change.
       state.skippedMissing++;
       state.lastAction = "skip_missing";
       state.lastDetail = summarizeLookupFailure(look);
-      log("skip missing @" + username + " — " + state.lastDetail);
+      log("skip missing " + label + " — " + state.lastDetail);
       return "advance_fast";
     }
 
-    // Safety: never block unless the API handle matches the list entry exactly.
-    if (actual.toLowerCase() !== username.toLowerCase()) {
+    // Safety: never block unless the API rest_id matches the list entry.
+    if (normId(resolvedId) !== id) {
       state.skippedMismatch++;
-      state.lastAction = "skip_mismatch:" + actual;
+      state.lastAction = "skip_mismatch:" + resolvedId;
       state.lastDetail = "";
-      log("skip mismatch @" + username + " → @" + actual);
+      log("skip mismatch id " + id + " → id " + resolvedId);
       return "advance_fast";
     }
+
+    state.current = handle ? "@" + handle : id;
 
     if (extractBlocking(result)) {
-      rememberBlocked(username);
+      rememberBlocked(id);
       state.skippedAlready++;
       state.lastAction = "skip_already";
       state.lastDetail = "";
-      log("skip already blocked @" + username);
+      log("skip already blocked " + label);
       return "advance_fast";
     }
 
@@ -540,28 +559,29 @@
     if (state.stopping) return "paused_mid";
 
     state.lastAction = "block";
-    log("blocking @" + username + " (id " + userId + ")");
+    log("blocking " + label);
     render();
 
-    const block = await blockUserId(userId);
+    const block = await blockUserId(id);
     if (isRateLimited(block.status, block.json, block.text)) {
-      log("rate-limited on block @" + username + " — waiting 15m");
+      log("rate-limited on block " + label + " — waiting 15m");
       await waitOutRateLimit("block");
       return "retry";
     }
 
     const blockedName = block.json && block.json.screen_name;
+    const blockedId =
+      (block.json && (block.json.id_str || String(block.json.id || ""))) || "";
     if (
       block.status >= 200 &&
       block.status < 300 &&
-      blockedName &&
-      blockedName.toLowerCase() === username.toLowerCase()
+      (!blockedId || normId(blockedId) === id)
     ) {
-      rememberBlocked(username);
+      rememberBlocked(id);
       state.blocked++;
       state.lastAction = "blocked";
       state.lastDetail = "";
-      log("blocked @" + username);
+      log("blocked " + userLabel(id, blockedName || handle));
       return "advance";
     }
 
@@ -570,38 +590,39 @@
       200
     );
     if (/already|blocked/i.test(errMsg)) {
-      rememberBlocked(username);
+      rememberBlocked(id);
       state.skippedAlready++;
       state.lastAction = "skip_already_err";
       state.lastDetail = "";
-      log("skip already blocked @" + username + " (api)");
+      log("skip already blocked " + label + " (api)");
       return "advance_fast";
     }
 
     state.failed++;
     state.lastAction = "fail";
     state.lastDetail = "HTTP " + block.status + " " + errMsg;
-    log("FAIL @" + username + " — " + state.lastDetail);
+    log("FAIL " + label + " — " + state.lastDetail);
     return "advance";
   }
 
-  // Cache handles that are no longer on the live list → candidates to unblock.
-  function cacheHandlesNotOnList() {
-    const onList = new Set(state.users.map(norm));
+  // Cache IDs that are no longer on the live list → candidates to unblock.
+  function cacheIdsNotOnList() {
+    const onList = new Set(state.users.map(normId));
     return Array.from(state.blockedCache).filter((u) => !onList.has(u));
   }
 
-  // Unblock one cached handle that left the list. Same outcome codes as processOne.
-  async function processUnblockOne(username) {
-    state.current = username;
+  // Unblock one cached ID that left the list. Same outcome codes as processOne.
+  async function processUnblockOne(userId) {
+    const id = normId(userId);
+    state.current = id;
     state.lastDetail = "";
     state.lastAction = "lookup_unblock";
-    log("lookup (unblock) @" + username);
+    log("lookup (unblock) id " + id);
     render();
 
-    const look = await lookupUser(username);
+    const look = await lookupUser(id);
     if (isRateLimited(look.status, look.json, look.text)) {
-      log("rate-limited on unblock-lookup @" + username + " — waiting 15m");
+      log("rate-limited on unblock-lookup id " + id + " — waiting 15m");
       await waitOutRateLimit("unblock_lookup");
       return "retry";
     }
@@ -612,62 +633,65 @@
       look.json.data.user &&
       look.json.data.user.result;
 
-    const actual = extractScreenName(result);
-    const userId = extractUserId(result);
+    const handle = extractScreenName(result);
+    const resolvedId = extractUserId(result);
+    const label = userLabel(id, handle);
 
     if (
       !result ||
       result.__typename === "UserUnavailable" ||
-      !actual ||
-      !userId
+      !resolvedId
     ) {
       // Gone / unavailable — drop from cache; nothing left to unblock.
-      forgetBlocked(username);
+      forgetBlocked(id);
       state.lastAction = "unblock_skip_missing";
       state.lastDetail = summarizeLookupFailure(look);
-      log("unblock skip missing @" + username + " — dropped from cache");
+      log("unblock skip missing " + label + " — dropped from cache");
       return "advance_fast";
     }
 
-    if (actual.toLowerCase() !== username.toLowerCase()) {
-      forgetBlocked(username);
-      state.lastAction = "unblock_skip_mismatch:" + actual;
-      log("unblock skip mismatch @" + username + " → @" + actual + " — dropped from cache");
+    if (normId(resolvedId) !== id) {
+      forgetBlocked(id);
+      state.lastAction = "unblock_skip_mismatch:" + resolvedId;
+      log("unblock skip mismatch id " + id + " → id " + resolvedId + " — dropped from cache");
       return "advance_fast";
     }
+
+    state.current = handle ? "@" + handle : id;
 
     if (!extractBlocking(result)) {
-      forgetBlocked(username);
+      forgetBlocked(id);
       state.lastAction = "unblock_already";
-      log("already unblocked @" + username + " — dropped from cache");
+      log("already unblocked " + label + " — dropped from cache");
       return "advance_fast";
     }
 
     if (state.stopping) return "paused_mid";
 
     state.lastAction = "unblock";
-    log("unblocking @" + username + " (id " + userId + ")");
+    log("unblocking " + label);
     render();
 
-    const unb = await unblockUserId(userId);
+    const unb = await unblockUserId(id);
     if (isRateLimited(unb.status, unb.json, unb.text)) {
-      log("rate-limited on unblock @" + username + " — waiting 15m");
+      log("rate-limited on unblock " + label + " — waiting 15m");
       await waitOutRateLimit("unblock");
       return "retry";
     }
 
     const unblockedName = unb.json && unb.json.screen_name;
+    const unblockedId =
+      (unb.json && (unb.json.id_str || String(unb.json.id || ""))) || "";
     if (
       unb.status >= 200 &&
       unb.status < 300 &&
-      unblockedName &&
-      unblockedName.toLowerCase() === username.toLowerCase()
+      (!unblockedId || normId(unblockedId) === id)
     ) {
-      forgetBlocked(username);
+      forgetBlocked(id);
       state.unblocked++;
       state.lastAction = "unblocked";
       state.lastDetail = "";
-      log("unblocked @" + username);
+      log("unblocked " + userLabel(id, unblockedName || handle));
       return "advance";
     }
 
@@ -676,16 +700,16 @@
       200
     );
     if (/not blocking|you are not blocking|not blocked/i.test(errMsg)) {
-      forgetBlocked(username);
+      forgetBlocked(id);
       state.lastAction = "unblock_already_err";
-      log("already unblocked @" + username + " (api) — dropped from cache");
+      log("already unblocked " + label + " (api) — dropped from cache");
       return "advance_fast";
     }
 
     state.failed++;
     state.lastAction = "unblock_fail";
     state.lastDetail = "HTTP " + unb.status + " " + errMsg;
-    log("FAIL unblock @" + username + " — " + state.lastDetail);
+    log("FAIL unblock " + label + " — " + state.lastDetail);
     return "advance";
   }
 
@@ -719,35 +743,35 @@
 
       // Always refresh so removals from the live list can be unblocked.
       state.lastAction = "downloading list";
-      log("downloading username list…");
+      log("downloading ID list…");
       render();
-      state.users = await fetchUsernames();
-      log("loaded " + state.users.length + " usernames");
+      state.users = await fetchUserIds();
+      log("loaded " + state.users.length + " user IDs");
       render();
 
-      // Phase 1: unblock cached handles that left the list (cache shrinks as we go).
-      const removed = cacheHandlesNotOnList();
+      // Phase 1: unblock cached IDs that left the list (cache shrinks as we go).
+      const removed = cacheIdsNotOnList();
       if (removed.length) {
-        log("unban check — " + removed.length + " cached handle(s) no longer on list");
+        log("unban check — " + removed.length + " cached ID(s) no longer on list");
         for (let i = 0; i < removed.length; i++) {
           if (state.stopping) break;
           // Re-check: may already have been cleared on a prior resume.
-          if (!state.blockedCache.has(norm(removed[i]))) continue;
+          if (!state.blockedCache.has(normId(removed[i]))) continue;
 
-          const username = removed[i];
+          const userId = removed[i];
           let outcome;
           try {
-            outcome = await processUnblockOne(username);
+            outcome = await processUnblockOne(userId);
           } catch (e) {
             state.failed++;
             state.lastAction = "unblock_exception";
             state.lastDetail = friendlyError(e).slice(0, 220);
-            log("exception unblock @" + username + " — " + state.lastDetail);
+            log("exception unblock id " + userId + " — " + state.lastDetail);
             outcome = "advance";
           }
 
           if (outcome === "retry") {
-            i--; // same handle after rate-limit wait
+            i--; // same ID after rate-limit wait
             continue;
           }
           if (outcome === "paused_mid") break;
@@ -775,15 +799,15 @@
       while (state.index < state.users.length) {
         if (state.stopping) break;
 
-        const username = state.users[state.index];
+        const userId = state.users[state.index];
         let outcome;
         try {
-          outcome = await processOne(username);
+          outcome = await processOne(userId);
         } catch (e) {
           state.failed++;
           state.lastAction = "exception";
           state.lastDetail = friendlyError(e).slice(0, 220);
-          log("exception @" + username + " — " + state.lastDetail);
+          log("exception id " + userId + " — " + state.lastDetail);
           outcome = "advance";
         }
 
@@ -1000,13 +1024,11 @@
     const total = state.users.length || "?";
     const sub = el.querySelector("[data-f=subtitle]");
     if (sub) {
-      const n = state.users.length
-        ? formatCount(state.users.length)
-        : "3,731+";
+      const listBit = state.users.length
+        ? formatCount(state.users.length) + " accounts · list by @levelsio"
+        : "Live list by @levelsio";
       sub.textContent =
-        n +
-        " accounts · list by @levelsio · cache " +
-        formatCount(state.blockedCache.size);
+        listBit + " · cache " + formatCount(state.blockedCache.size);
     }
     el.querySelector("[data-f=stats]").textContent =
       "Blocked: " +
@@ -1026,7 +1048,11 @@
       ")\nFailed: " +
       state.failed;
     el.querySelector("[data-f=progress]").textContent =
-      "Progress: " + state.index + " / " + total + (state.current ? " — @" + state.current : "");
+      "Progress: " +
+      state.index +
+      " / " +
+      total +
+      (state.current ? " — " + state.current : "");
     el.querySelector("[data-f=action]").textContent =
       "Status: " + state.lastAction + (state.lastDetail ? " — " + state.lastDetail : "");
 
@@ -1211,7 +1237,7 @@
       </div>
       <div class="xbl-body" data-f="body">
         <div data-f="subtitle" style="font:11px/1.35 system-ui,sans-serif;margin:6px 0 8px;opacity:.7">
-          3,731 accounts · list by @levelsio
+          Live list by @levelsio
         </div>
         <div data-f="progress" style="font:12px/1.4 system-ui,sans-serif;margin-bottom:4px"></div>
         <div data-f="stats" style="font:12px/1.45 system-ui,sans-serif;margin-bottom:4px;white-space:pre-line"></div>
@@ -1225,7 +1251,7 @@
           <button data-f="clearlog" class="xbl-btn">Clear log</button>
         </div>
         <div style="font:11px/1.35 system-ui,sans-serif;margin-top:10px;opacity:.75">
-          Blocks exact list handles; unblocks cached ones removed from the list. Stay on x.com while it runs. Reset keeps your blocked cache.
+          Blocks by user ID (rename-safe); unblocks cached IDs removed from the list. Stay on x.com while it runs. Reset keeps your blocked cache.
         </div>
         <div style="font:10px/1.4 system-ui,sans-serif;margin-top:6px;opacity:.65">
           Created by <a class="xbl-link" href="https://x.com/glaurossii" target="_blank" rel="noopener noreferrer">@glaurossi</a>
@@ -1274,7 +1300,7 @@
       if (state.running) return;
       if (
         confirm(
-          "Reset progress counters and start index to 0?\n\nYour blocked cache is kept so re-runs stay fast."
+          "Reset progress counters and start index to 0?\n\nYour blocked-ID cache is kept so re-runs stay fast."
         )
       ) {
         resetProgress();
@@ -1287,7 +1313,7 @@
         confirm(
           "Clear the local blocked cache (" +
             state.blockedCache.size +
-            " handles)?\n\nNext run will re-lookup those accounts."
+            " IDs)?\n\nNext run will re-lookup those accounts."
         )
       ) {
         clearBlockedCache();
