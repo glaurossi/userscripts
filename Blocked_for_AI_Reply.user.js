@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Blocked for AI Reply
 // @namespace    https://local.x-block-list
-// @version      1.4.3
+// @version      1.4.5
 // @description  Block the levels.io “Blocked for AI Reply” spam list on X — block by user ID, skip missing/already-blocked, unblock if removed from list, cache + rate-limit aware
 // @author       glaurossi
 // @license      MIT
@@ -25,7 +25,8 @@
   // Config
 
   // Plain-text list from levelsio (one numeric user ID per line).
-  const LIST_URL = "https://blockedforaireply.com/api/ids.txt";
+  const LIST_HOME = "https://blockedforaireply.com/";
+  const LIST_URL = LIST_HOME + "api/ids.txt";
   // Public X web client bearer — not a user secret.
   const BEARER =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -97,6 +98,31 @@
     return new Date().toLocaleTimeString(undefined, { hour12: false });
   }
 
+  // Turn http(s) URLs in plain text into clickable links (safe: text + <a> only).
+  function fillWithLinks(el, text) {
+    el.textContent = "";
+    const str = String(text || "");
+    const re = /(https?:\/\/[^\s]+)/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(str))) {
+      if (m.index > last) {
+        el.appendChild(document.createTextNode(str.slice(last, m.index)));
+      }
+      const a = document.createElement("a");
+      a.className = "xbl-link";
+      a.href = m[1];
+      a.textContent = m[1];
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      el.appendChild(a);
+      last = m.index + m[1].length;
+    }
+    if (last < str.length) {
+      el.appendChild(document.createTextNode(str.slice(last)));
+    }
+  }
+
   // Append a line to the on-panel log (and keep it from growing forever).
   function log(msg) {
     const line = "[" + ts() + "] " + msg;
@@ -106,7 +132,7 @@
     }
     const box = document.querySelector("#x-block-list-panel [data-f=log]");
     if (box) {
-      box.textContent = state.logLines.join("\n");
+      fillWithLinks(box, state.logLines.join("\n"));
       box.scrollTop = box.scrollHeight;
     }
   }
@@ -337,15 +363,40 @@
     });
   }
 
+  function looksLikeCloudflareBlock(status, body) {
+    if (status === 403 || status === 503) return true;
+    const text = String(body || "");
+    return /just a moment|cf-browser-verification|cloudflare|attention required/i.test(
+      text.slice(0, 2000)
+    );
+  }
+
   async function fetchUserIds() {
     const res = await gmGet(LIST_URL);
+    const body = res.responseText || "";
+    if (looksLikeCloudflareBlock(res.status, body)) {
+      throw new Error(
+        "List download blocked by Cloudflare (HTTP " +
+          res.status +
+          "). Userscripts can’t pass the JS challenge — needs a skip on /api/ids.txt. " +
+          "Open " +
+          LIST_HOME +
+          " in a tab to confirm, then try again later."
+      );
+    }
     if (res.status < 200 || res.status >= 300) {
       throw new Error("List download failed: HTTP " + res.status);
     }
-    return String(res.responseText || "")
+    const ids = String(body)
       .split(/\r?\n/)
       .map((s) => normId(s))
       .filter(Boolean);
+    if (!ids.length) {
+      throw new Error(
+        "List download returned no IDs — the response may be a block page. Try again later."
+      );
+    }
+    return ids;
   }
 
   // Resolve a user ID → user object (handle + whether we already block them).
@@ -830,8 +881,9 @@
       log(state.stopping ? "paused at index " + state.index : "finished");
     } catch (e) {
       state.lastAction = "error";
-      state.lastDetail = friendlyError(e).slice(0, 220);
-      log("error — " + state.lastDetail);
+      const msg = friendlyError(e);
+      state.lastDetail = msg.slice(0, 280);
+      log("error — " + msg);
     } finally {
       state.running = false;
       state.stopping = false;
@@ -1053,8 +1105,10 @@
       " / " +
       total +
       (state.current ? " — " + state.current : "");
-    el.querySelector("[data-f=action]").textContent =
-      "Status: " + state.lastAction + (state.lastDetail ? " — " + state.lastDetail : "");
+    fillWithLinks(
+      el.querySelector("[data-f=action]"),
+      "Status: " + state.lastAction + (state.lastDetail ? " — " + state.lastDetail : "")
+    );
 
     const mini = el.querySelector("[data-f=mini-status]");
     if (mini) {
